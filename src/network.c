@@ -44,6 +44,7 @@ static DWORD WINAPI recv_thread_func(LPVOID param) {
             break;
         }
         tmp[size] = '\0';
+        printf("[RecvThread] Got %d bytes: %.80s...\n", size, tmp);
 
         // 只關心 UPDATE 訊息
         if (strstr(tmp, "UPDATE")) {
@@ -52,6 +53,7 @@ static DWORD WINAPI recv_thread_func(LPVOID param) {
             _pending_buf[RECV_BUF_SIZE - 1] = '\0';
             _has_pending = true;
             LeaveCriticalSection(&_pending_lock);
+            printf("[RecvThread] UPDATE stored, pending=true\n");
         } else {
             // 其他訊息（如 WIN/LOSE/DRAW）直接印出到 console
             printf("[Server] %s\n", tmp);

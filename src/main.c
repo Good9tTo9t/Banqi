@@ -1,18 +1,12 @@
-// ── 必須先 include raylib，再解除 windows.h 的同名 macro 衝突 ──
-// windows.h（透過 network.h 間接引入）有幾個與 Raylib 同名的 WinAPI：
-//   CloseWindow(HWND)、DrawText(...)、ShowCursor(BOOL)
-// 在這裡統一 undef，確保後續呼叫的是 Raylib 版本。
-#include "raylib.h"
-#ifdef CloseWindow
-#undef CloseWindow
-#endif
-#ifdef DrawText
-#undef DrawText
-#endif
-#ifdef ShowCursor
-#undef ShowCursor
-#endif
+// ── 包含 raylib 與 Windows API 時的衝突處理 ──
+// raylib 和 windows.h 都有定義 Rectangle、CloseWindow、ShowCursor 等符號。
+// 我們透過定義 NOGDI 和 NOUSER 來避免 windows.h 引入不必要的圖形與視窗定義。
+// WIN32_LEAN_AND_MEAN 可避免引入 OLE 等需要 USER 定義的模組。
+#define WIN32_LEAN_AND_MEAN
+#define NOGDI
+#define NOUSER
 
+#include "raylib.h"
 #include "game_state.h"
 #include "board.h"
 #include "renderer.h"
@@ -23,7 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>  // Sleep()
+#include <windows.h>  // Sleep(), CreateThread()
+
+
 
 // ============================================================
 //  main.c — 主程式入口
@@ -113,9 +109,11 @@ static void process_server_update(const char* json) {
     // 解析 state
     char state_str[20];
     board_get_game_state_str(json, state_str);
+    printf("[Update] state=%s, myRole=%s\n", state_str, gs.myRoleAB);
 
     if (strcmp(state_str, "waiting") == 0) {
         gs.state = STATE_WAITING;
+        printf("[Update] Still waiting...\n");
         return;
     }
 
@@ -138,6 +136,9 @@ static void process_server_update(const char* json) {
         int total_moves = board_get_total_moves(json);
         char turn_role  = board_get_current_turn_role(json);
         bool my_turn    = (turn_role == gs.myRoleAB[0]);
+
+        printf("[Update] turn_role='%c', myRoleAB='%s', my_turn=%d, total_moves=%d, lastMoves=%d\n",
+               turn_role ? turn_role : '?', gs.myRoleAB, my_turn, total_moves, gs.lastTotalMoves);
 
         gs.isMyTurn = my_turn;
 
@@ -255,8 +256,11 @@ static void reset_game(void) {
 
 // ── main ──────────────────────────────────────────────────────
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);  // 關閉 stdout 緩衝，printf 立即顯示
+    SetConsoleOutputCP(65001);          // 設定 console 為 UTF-8 編碼
+    SetConsoleCP(65001);                // 輸入也用 UTF-8
     srand((unsigned int)time(NULL));
-
+    printf("The program has started\n");
     // 初始化 SharedState
     memset(&gs, 0, sizeof(gs));
     gs.state          = STATE_MAIN_MENU;
@@ -289,9 +293,11 @@ int main(void) {
         // ── 主選單 ──
         case STATE_MAIN_MENU:
             if (IsKeyPressed(KEY_ONE)) {
+                printf("[Main] KEY_ONE pressed -> Local mode\n");
                 gs.mode  = MODE_LOCAL;
                 gs.state = STATE_HAND_MENU;
             } else if (IsKeyPressed(KEY_TWO)) {
+                printf("[Main] KEY_TWO pressed -> Online mode\n");
                 gs.mode  = MODE_ONLINE;
                 gs.state = STATE_CONNECTING;
                 // 初始化網路（非阻塞，畫面會繼續跑）
