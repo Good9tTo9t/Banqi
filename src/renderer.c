@@ -13,7 +13,8 @@
     "請選擇模式先後手：12.玩家電腦翻第一張牌輪到你了思考中..." \
     "你的陣營未定紅黑方獲勝按下R鍵重新開始" \
     "線上對戰本地單機連接房間號碼輸入等待對手加入中斷線" \
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :"
+    "（）伺服器至看視窗操作角色！" \
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 :.%-"
 
 int renderer_init(Renderer* r, int screenWidth, int screenHeight) {
     r->boardTex  = LoadTexture("texture/board.png");
