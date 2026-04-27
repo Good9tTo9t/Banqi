@@ -1,404 +1,436 @@
+// ── 必須先 include raylib，再解除 windows.h 的同名 macro 衝突 ──
+// windows.h（透過 network.h 間接引入）有幾個與 Raylib 同名的 WinAPI：
+//   CloseWindow(HWND)、DrawText(...)、ShowCursor(BOOL)
+// 在這裡統一 undef，確保後續呼叫的是 Raylib 版本。
 #include "raylib.h"
+#ifdef CloseWindow
+#undef CloseWindow
+#endif
+#ifdef DrawText
+#undef DrawText
+#endif
+#ifdef ShowCursor
+#undef ShowCursor
+#endif
+
+#include "game_state.h"
+#include "board.h"
+#include "renderer.h"
+#include "ai.h"
+#include "network.h"
+
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
-#include <math.h>
-#include <stdbool.h>
+#include <windows.h>  // Sleep()
 
-typedef enum { PIECE_RED, PIECE_BLACK } PieceColor;
-typedef enum { GENERAL, ADVISOR, ELEPHANT, CHARIOT, HORSE, CANNON, SOLDIER } Role;
-// 新增了 STATE_MENU 用來讓玩家選擇先手或後手
-typedef enum { STATE_MENU, STATE_PLAYING, STATE_RED_WIN, STATE_BLACK_WIN } GameState;
+// ============================================================
+//  main.c — 主程式入口
+//
+//  遊戲狀態機：
+//
+//   STATE_MAIN_MENU
+//       │ KEY_1 → 本地模式
+//       │ KEY_2 → 線上模式
+//       ▼
+//   STATE_HAND_MENU (本地)    STATE_CONNECTING (線上)
+//       │ KEY_1/2                   │ console 輸入 JOIN
+//       ▼                           ▼
+//   STATE_PLAYING ──────────────────┘
+//       │ 帥/將被吃
+//       ▼
+//   STATE_RED_WIN / STATE_BLACK_WIN
+//       │ KEY_R
+//       ▼
+//   STATE_MAIN_MENU
+//
+//  執行緒：
+//    主執行緒 — Raylib 遊戲迴圈（繪圖 + 輸入 + 本地 AI）
+//    背景執行緒（線上模式）— network.c 的 recv_thread_func
+// ============================================================
 
-typedef struct Piece {
-    PieceColor color;
-    Role role;
-    bool isFlipped;
-    bool isEmpty;
-} Piece;
+#define SCREEN_W 800
+#define SCREEN_H 450
 
-const char* RED_NAMES[] = { "帥", "仕", "相", "俥", "傌", "炮", "兵" };
-const char* BLACK_NAMES[] = { "將", "士", "象", "車", "馬", "包", "卒" };
+// ── 全域共享狀態 ──────────────────────────────────────────────
+static SharedState gs;
+static Renderer    renderer;
 
-Piece boardGrid[4][8];
-GameState gameState = STATE_MENU;
+// ── 線上模式輔助：console 輸入房間號碼 ───────────────────────
+// 因為 Raylib 視窗無法方便地輸入文字，
+// 線上模式的「輸入房號」改在 console 完成（另開執行緒讓 Raylib 不卡住）
 
-// 遊戲狀態追蹤
-int currentTurn = -1; // 0: 紅方回合, 1: 黑方回合
-int selectedRow = -1;
-int selectedCol = -1;
+static char   _pending_room_id[32] = "";
+static volatile bool _room_input_done = false;
 
-// 人機對戰新增變數
-int humanColor = -1;     // 玩家的陣營 (0或1)，-1代表還沒翻出第一張牌
-int computerColor = -1;  // 電腦的陣營
-bool isHumanTurn = true; // 現在是不是玩家的操作回合
-int aiTimer = 0;         // 電腦思考的延遲計時器
-
-void InitAndShuffleBoard() {
-    Piece deck[32];
-    int index = 0;
-    int counts[7] = { 1, 2, 2, 2, 2, 2, 5 };
-
-    for (int c = 0; c <= 1; c++) {
-        for (int r = 0; r < 7; r++) {
-            for (int i = 0; i < counts[r]; i++) {
-                deck[index].color = (PieceColor)c;
-                deck[index].role = (Role)r;
-                deck[index].isFlipped = false;
-                deck[index].isEmpty = false;
-                index++;
-            }
-        }
+static DWORD WINAPI room_input_thread(LPVOID param) {
+    (void)param;
+    char buf[64];
+    printf("\n====================================\n");
+    printf("[線上模式] 請輸入要加入的房間號碼：");
+    fflush(stdout);
+    if (fgets(buf, sizeof(buf), stdin)) {
+        buf[strcspn(buf, "\r\n")] = '\0';
+        strncpy(_pending_room_id, buf, sizeof(_pending_room_id) - 1);
     }
-
-    srand((unsigned int)time(NULL));
-    for (int i = 31; i > 0; i--) {
-        int j = rand() % (i + 1);
-        Piece temp = deck[i];
-        deck[i] = deck[j];
-        deck[j] = temp;
-    }
-
-    index = 0;
-    for (int row = 0; row < 4; row++) {
-        for (int col = 0; col < 8; col++) {
-            boardGrid[row][col] = deck[index++];
-        }
-    }
-
-    // 重置所有狀態到選單
-    gameState = STATE_MENU;
-    currentTurn = -1;
-    selectedRow = -1;
-    selectedCol = -1;
-    humanColor = -1;
-    computerColor = -1;
-    isHumanTurn = true;
-    aiTimer = 0;
+    _room_input_done = true;
+    return 0;
 }
 
-bool IsValidMove(int sr, int sc, int dr, int dc) {
-    Piece pSrc = boardGrid[sr][sc];
-    Piece pDest = boardGrid[dr][dc];
-    if (sr != dr && sc != dc) return false;
+// ── 線上模式加入房間（在 console 執行緒完成後觸發）────────────
+static void do_join_room(void) {
+    char role[16] = "";
+    printf("[Main] Joining room: %s\n", _pending_room_id);
 
-    int dist = abs(sr - dr) + abs(sc - dc);
-
-    if (pSrc.role == CANNON) {
-        if (pDest.isEmpty) return dist == 1;
-        int count = 0;
-        if (sr == dr) {
-            int minC = (sc < dc) ? sc : dc;
-            int maxC = (sc > dc) ? sc : dc;
-            for (int c = minC + 1; c < maxC; c++) if (!boardGrid[sr][c].isEmpty) count++;
-        }
-        else {
-            int minR = (sr < dr) ? sr : dr;
-            int maxR = (sr > dr) ? sr : dr;
-            for (int r = minR + 1; r < maxR; r++) if (!boardGrid[r][sc].isEmpty) count++;
-        }
-        return (count == 1 && pDest.isFlipped && pDest.color != pSrc.color);
-    }
-
-    if (dist != 1) return false;
-    if (pDest.isEmpty) return true;
-    if (!pDest.isFlipped || pSrc.color == pDest.color) return false;
-    if (pSrc.role == GENERAL && pDest.role == SOLDIER) return false;
-    if (pSrc.role == SOLDIER && pDest.role == GENERAL) return true;
-
-    return pSrc.role <= pDest.role;
-}
-
-void CheckWinCondition() {
-    bool redGeneralAlive = false;
-    bool blackGeneralAlive = false;
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 8; c++) {
-            if (!boardGrid[r][c].isEmpty && boardGrid[r][c].role == GENERAL) {
-                if (boardGrid[r][c].color == PIECE_RED) redGeneralAlive = true;
-                else blackGeneralAlive = true;
-            }
-        }
-    }
-    if (currentTurn != -1) {
-        if (!redGeneralAlive) gameState = STATE_BLACK_WIN;
-        else if (!blackGeneralAlive) gameState = STATE_RED_WIN;
-    }
-}
-
-// 幫助函數：檢查某個位置的棋子是否正受到敵人威脅
-bool IsUnderThreat(int r, int c) {
-    Piece p = boardGrid[r][c];
-    for (int er = 0; er < 4; er++) {
-        for (int ec = 0; ec < 8; ec++) {
-            Piece enemy = boardGrid[er][ec];
-            if (!enemy.isEmpty && enemy.isFlipped && enemy.color != p.color) {
-                if (IsValidMove(er, ec, r, c)) return true;
-            }
-        }
-    }
-    return false;
-}
-
-// --- 電腦 AI 邏輯核心 ---
-void DoComputerMove() {
-    // 條件 6: 遇到會被吃的棋子要避開 (最高優先級)
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 8; c++) {
-            Piece p = boardGrid[r][c];
-            if (!p.isEmpty && p.isFlipped && (int)p.color == computerColor) {
-                if (IsUnderThreat(r, c)) {
-                    // 嘗試尋找任何合法的步數來逃跑 (移動到空格或吃掉敵人)
-                    for (int dr = 0; dr < 4; dr++) {
-                        for (int dc = 0; dc < 8; dc++) {
-                            if (IsValidMove(r, c, dr, dc)) {
-                                boardGrid[dr][dc] = boardGrid[r][c];
-                                boardGrid[r][c].isEmpty = true;
-                                return; // 執行完畢
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 條件 5: 遇到旁邊可以吃的棋子，吃掉它
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 8; c++) {
-            Piece p = boardGrid[r][c];
-            if (!p.isEmpty && p.isFlipped && (int)p.color == computerColor) {
-                for (int dr = 0; dr < 4; dr++) {
-                    for (int dc = 0; dc < 8; dc++) {
-                        Piece target = boardGrid[dr][dc];
-                        if (!target.isEmpty && target.isFlipped && target.color != p.color) {
-                            if (IsValidMove(r, c, dr, dc)) {
-                                boardGrid[dr][dc] = boardGrid[r][c];
-                                boardGrid[r][c].isEmpty = true;
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 條件 4: 繼續翻棋子或隨機走動 (如果沒有危險也沒有東西吃)
-    int unflippedR[32], unflippedC[32], unflippedCount = 0;
-    int moveSrcR[128], moveSrcC[128], moveDstR[128], moveDstC[128], moveCount = 0;
-
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 8; c++) {
-            Piece p = boardGrid[r][c];
-            if (!p.isEmpty && !p.isFlipped) {
-                // 收集未翻開的棋子
-                unflippedR[unflippedCount] = r;
-                unflippedC[unflippedCount] = c;
-                unflippedCount++;
-            }
-            else if (!p.isEmpty && p.isFlipped && (int)p.color == computerColor) {
-                // 收集可以走到空格的步數
-                for (int dr = 0; dr < 4; dr++) {
-                    for (int dc = 0; dc < 8; dc++) {
-                        if (boardGrid[dr][dc].isEmpty && IsValidMove(r, c, dr, dc)) {
-                            moveSrcR[moveCount] = r; moveSrcC[moveCount] = c;
-                            moveDstR[moveCount] = dr; moveDstC[moveCount] = dc;
-                            moveCount++;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 如果電腦還沒決定顏色 (代表它是整場遊戲第一個動的)，它只能翻牌
-    if (computerColor == -1 && unflippedCount > 0) {
-        int randIdx = rand() % unflippedCount;
-        int r = unflippedR[randIdx], c = unflippedC[randIdx];
-        boardGrid[r][c].isFlipped = true;
-        computerColor = (int)boardGrid[r][c].color;
-        humanColor = 1 - computerColor;
+    if (network_join_room(_pending_room_id, role, sizeof(role)) != 0) {
+        printf("[Main] Failed to join room. Returning to main menu.\n");
+        gs.state = STATE_MAIN_MENU;
         return;
     }
 
-    // 隨機決定要翻牌還是移動
-    int totalActions = unflippedCount + moveCount;
-    if (totalActions > 0) {
-        int randIdx = rand() % totalActions;
-        if (randIdx < unflippedCount) { // 抽到翻牌
-            int r = unflippedR[randIdx], c = unflippedC[randIdx];
-            boardGrid[r][c].isFlipped = true;
-            if (humanColor == -1) { // 遊戲第一手
-                computerColor = (int)boardGrid[r][c].color;
-                humanColor = 1 - computerColor;
+    // 設定角色
+    strncpy(gs.roomId, _pending_room_id, sizeof(gs.roomId) - 1);
+    if (strcmp(role, "first") == 0) {
+        gs.serverRole = ROLE_FIRST;
+        strcpy(gs.myRoleAB, "A");
+    } else {
+        gs.serverRole = ROLE_SECOND;
+        strcpy(gs.myRoleAB, "B");
+    }
+    gs.myColor[0]  = '\0';   // 等翻牌後才知道顏色
+    gs.oppColor[0] = '\0';
+    gs.lastTotalMoves = -1;
+    gs.isMyTurn = false;
+
+    network_start_recv_thread();
+    gs.state = STATE_WAITING;
+    printf("[Main] Waiting for game to start...\n");
+}
+
+// ── 線上模式：處理一條伺服器 UPDATE ────────────────────────────
+static void process_server_update(const char* json) {
+    // 解析 state
+    char state_str[20];
+    board_get_game_state_str(json, state_str);
+
+    if (strcmp(state_str, "waiting") == 0) {
+        gs.state = STATE_WAITING;
+        return;
+    }
+
+    if (strcmp(state_str, "playing") == 0 || strcmp(state_str, "finished") == 0) {
+        // 更新棋盤
+        board_parse_json(&gs, json);
+
+        // 更新我的顏色（第一手翻牌後才有）
+        if (gs.myColor[0] == '\0') {
+            char color[10];
+            board_get_role_color(json, gs.myRoleAB, color);
+            if (strcmp(color, "None") != 0) {
+                strncpy(gs.myColor, color, sizeof(gs.myColor) - 1);
+                strcpy(gs.oppColor, strcmp(color, "Red") == 0 ? "Black" : "Red");
+                printf("[Main] My color: %s\n", gs.myColor);
             }
         }
-        else { // 抽到移動
-            int mIdx = randIdx - unflippedCount;
-            boardGrid[moveDstR[mIdx]][moveDstC[mIdx]] = boardGrid[moveSrcR[mIdx]][moveSrcC[mIdx]];
-            boardGrid[moveSrcR[mIdx]][moveSrcC[mIdx]].isEmpty = true;
+
+        // 判斷是否輪到自己
+        int total_moves = board_get_total_moves(json);
+        char turn_role  = board_get_current_turn_role(json);
+        bool my_turn    = (turn_role == gs.myRoleAB[0]);
+
+        gs.isMyTurn = my_turn;
+
+        if (strcmp(state_str, "playing") == 0) {
+            gs.state = STATE_PLAYING;
         }
+
+        // 如果是我的回合且 total_moves 變化了，執行 AI 動作
+        if (my_turn && total_moves != gs.lastTotalMoves) {
+            printf("\n--- My Turn! (Move %d) ---\n", total_moves);
+            gs.lastTotalMoves = total_moves;
+
+            // 如果顏色未定（第一手），先翻牌
+            if (gs.myColor[0] == '\0') {
+                // 找任意一個 Covered 格子翻
+                char piece_name[32];
+                for (int i = 0; i < 32; i++) {
+                    board_get_piece_at(json, i, piece_name);
+                    if (strcmp(piece_name, "Covered") == 0) {
+                        char action[32];
+                        snprintf(action, sizeof(action), "%d %d\n", i / 8, i % 8);
+                        printf("[Main] First flip at index %d\n", i);
+                        Sleep(1500);
+                        network_send_action(action);
+                        return;
+                    }
+                }
+            }
+
+            // 呼叫 AI 決定動作
+            if (gs.myColor[0] != '\0') {
+                char action[64] = "";
+                if (server_ai_decide(json, gs.myColor, action, sizeof(action))) {
+                    Sleep(1500);  // 模擬思考時間
+                    network_send_action(action);
+                } else {
+                    printf("[Main] AI failed to decide a move!\n");
+                }
+            }
+        }
+
+        // 勝負判定（本地檢查一次）
+        board_check_win(&gs);
     }
 }
 
+// ── 本地模式：玩家滑鼠操作 ────────────────────────────────────
+static void handle_local_player_click(Vector2 mouse) {
+    int row, col;
+    if (!renderer_screen_to_grid(&renderer, mouse, &row, &col)) return;
+
+    Piece* target = &gs.board[row][col];
+
+    if (gs.selectedRow == -1) {
+        // 未選中狀態
+        if (!target->isEmpty && !target->isFlipped) {
+            // 翻牌
+            target->isFlipped = true;
+            if (gs.humanColor == -1) {
+                gs.humanColor    = (int)target->color;
+                gs.computerColor = 1 - gs.humanColor;
+                gs.currentTurn   = gs.computerColor;
+            } else {
+                gs.currentTurn = 1 - gs.currentTurn;
+            }
+            gs.isHumanTurn = false;
+        } else if (!target->isEmpty && target->isFlipped &&
+                   (int)target->color == gs.humanColor) {
+            // 選中己方棋子
+            gs.selectedRow = row;
+            gs.selectedCol = col;
+        }
+    } else {
+        // 已選中狀態
+        if (row == gs.selectedRow && col == gs.selectedCol) {
+            // 取消選取
+            gs.selectedRow = -1;
+            gs.selectedCol = -1;
+        } else if (!target->isEmpty && target->isFlipped &&
+                   (int)target->color == gs.humanColor) {
+            // 換選另一個己方棋子
+            gs.selectedRow = row;
+            gs.selectedCol = col;
+        } else if (board_is_valid_move(&gs, gs.selectedRow, gs.selectedCol, row, col)) {
+            // 執行移動/吃子
+            gs.board[row][col] = gs.board[gs.selectedRow][gs.selectedCol];
+            gs.board[gs.selectedRow][gs.selectedCol].isEmpty = true;
+            gs.selectedRow = -1;
+            gs.selectedCol = -1;
+            gs.currentTurn = 1 - gs.currentTurn;
+            gs.isHumanTurn = false;
+        }
+    }
+    board_check_win(&gs);
+}
+
+// ── 重置為初始狀態 ─────────────────────────────────────────────
+static void reset_game(void) {
+    // 線上模式的連線不在這裡重置（只重置本地遊戲狀態）
+    if (gs.mode == MODE_ONLINE) {
+        network_close();
+    }
+    memset(&gs, 0, sizeof(gs));
+    gs.state       = STATE_MAIN_MENU;
+    gs.selectedRow = -1;
+    gs.selectedCol = -1;
+    gs.humanColor  = -1;
+    gs.computerColor = -1;
+    gs.currentTurn = -1;
+    gs.isHumanTurn = true;
+    gs.lastTotalMoves = -1;
+    _pending_room_id[0] = '\0';
+    _room_input_done    = false;
+}
+
+// ── main ──────────────────────────────────────────────────────
 int main(void) {
-    const int screenWidth = 800;
-    const int screenHeight = 450;
+    srand((unsigned int)time(NULL));
 
-    InitWindow(screenWidth, screenHeight, "Banqi - AI Survival");
+    // 初始化 SharedState
+    memset(&gs, 0, sizeof(gs));
+    gs.state          = STATE_MAIN_MENU;
+    gs.selectedRow    = -1;
+    gs.selectedCol    = -1;
+    gs.humanColor     = -1;
+    gs.computerColor  = -1;
+    gs.currentTurn    = -1;
+    gs.isHumanTurn    = true;
+    gs.lastTotalMoves = -1;
 
-    Texture2D boardTex = LoadTexture("texture/board.png");
-    Texture2D pieceBack = LoadTexture("texture/piece_back.png");
-    Texture2D pieceRed = LoadTexture("texture/piece_red.png");
-    Texture2D pieceBlack = LoadTexture("texture/piece_black.png");
-
-    // 增加了必須的字元，確保 UI 顯示正常
-    int cpCount = 0;
-    int* cps = LoadCodepoints("帥仕相俥傌炮兵將士象車馬包卒請選擇先後手：12.玩家電腦翻第一張牌輪到你了思考中...你的陣營未定紅黑方獲勝！按下 R鍵重新開始", &cpCount);
-    Font font = LoadFontEx("texture/LXGWWenKaiTC-Bold.ttf", 50, cps, cpCount);
-    UnloadCodepoints(cps);
-
-    InitAndShuffleBoard();
-
-    float bx = screenWidth / 2.0f - boardTex.width / 2.0f;
-    float by = screenHeight / 2.0f - boardTex.height / 2.0f;
-    float sx = 62.0f, sy = 89.0f, rm = 62.0f, bm = 18.0f;
-    float cw = (boardTex.width - sx - rm) / 8.0f;
-    float ch = (boardTex.height - sy - bm) / 4.0f;
-
+    // 初始化 Raylib
+    InitWindow(SCREEN_W, SCREEN_H, "暗棋 Dark Chess");
     SetTargetFPS(60);
 
+    if (renderer_init(&renderer, SCREEN_W, SCREEN_H) != 0) {
+        CloseWindow();
+        return 1;
+    }
+
+    // ── 主遊戲迴圈 ───────────────────────────────────────────
     while (!WindowShouldClose()) {
 
-        // 狀態：選單 (選擇先後手)
-        if (gameState == STATE_MENU) {
+        // ========================================================
+        //  UPDATE
+        // ========================================================
+
+        switch (gs.state) {
+
+        // ── 主選單 ──
+        case STATE_MAIN_MENU:
             if (IsKeyPressed(KEY_ONE)) {
-                isHumanTurn = true;
-                gameState = STATE_PLAYING;
+                gs.mode  = MODE_LOCAL;
+                gs.state = STATE_HAND_MENU;
+            } else if (IsKeyPressed(KEY_TWO)) {
+                gs.mode  = MODE_ONLINE;
+                gs.state = STATE_CONNECTING;
+                // 初始化網路（非阻塞，畫面會繼續跑）
+                printf("[Main] Connecting to server...\n");
+                if (network_init() != 0) {
+                    printf("[Main] Server connection failed. Back to menu.\n");
+                    gs.state = STATE_MAIN_MENU;
+                } else {
+                    // 開 console 執行緒讓使用者輸入房號
+                    _room_input_done = false;
+                    HANDLE t = CreateThread(NULL, 0, room_input_thread, NULL, 0, NULL);
+                    CloseHandle(t);
+                }
             }
-            else if (IsKeyPressed(KEY_TWO)) {
-                isHumanTurn = false;
-                gameState = STATE_PLAYING;
+            break;
+
+        // ── 先後手選單（本地模式）──
+        case STATE_HAND_MENU:
+            if (IsKeyPressed(KEY_ONE)) {
+                // 玩家先手：人先翻牌
+                board_init_and_shuffle(&gs);
+                gs.isHumanTurn = true;
+                gs.state       = STATE_PLAYING;
+            } else if (IsKeyPressed(KEY_TWO)) {
+                // 電腦先手：AI 先翻牌
+                board_init_and_shuffle(&gs);
+                gs.isHumanTurn = false;
+                gs.state       = STATE_PLAYING;
             }
+            break;
+
+        // ── 連線中（等待 console 輸入完成）──
+        case STATE_CONNECTING:
+            if (_room_input_done) {
+                _room_input_done = false;
+                do_join_room();
+            }
+            break;
+
+        // ── 等待對手 ──
+        case STATE_WAITING: {
+            char update_buf[8192];
+            if (network_poll(update_buf, sizeof(update_buf))) {
+                process_server_update(update_buf);
+            }
+            break;
         }
-        // 狀態：遊玩中
-        else if (gameState == STATE_PLAYING) {
 
-            // 玩家回合邏輯
-            if (isHumanTurn) {
-                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                    Vector2 m = GetMousePosition();
-                    if (m.x >= bx + sx && m.x <= bx + boardTex.width - rm && m.y >= by + sy && m.y <= by + boardTex.height - bm) {
-                        int col = (int)((m.x - (bx + sx)) / cw);
-                        int row = (int)((m.y - (by + sy)) / ch);
-                        Piece* target = &boardGrid[row][col];
+        // ── 遊玩中 ──
+        case STATE_PLAYING:
 
-                        if (selectedRow == -1) {
-                            if (!target->isEmpty && !target->isFlipped) {
-                                target->isFlipped = true;
-                                if (humanColor == -1) { // 玩家翻開第一張牌
-                                    humanColor = target->color;
-                                    computerColor = 1 - humanColor;
-                                    currentTurn = computerColor; // 換電腦
-                                }
-                                else {
-                                    currentTurn = 1 - currentTurn;
-                                }
-                                isHumanTurn = false; // 玩家操作完，換電腦
-                            }
-                            else if (!target->isEmpty && target->isFlipped && (int)target->color == humanColor) {
-                                selectedRow = row; selectedCol = col;
-                            }
-                        }
-                        else {
-                            if (row == selectedRow && col == selectedCol) {
-                                selectedRow = -1; selectedCol = -1;
-                            }
-                            else if (!target->isEmpty && target->isFlipped && (int)target->color == humanColor) {
-                                selectedRow = row; selectedCol = col;
-                            }
-                            else if (IsValidMove(selectedRow, selectedCol, row, col)) {
-                                boardGrid[row][col] = boardGrid[selectedRow][selectedCol];
-                                boardGrid[selectedRow][selectedCol].isEmpty = true;
-                                selectedRow = -1; selectedCol = -1;
-                                currentTurn = 1 - currentTurn;
-                                isHumanTurn = false; // 玩家移動完，換電腦
-                            }
-                        }
-                        CheckWinCondition();
+            if (gs.mode == MODE_LOCAL) {
+                // ── 本地模式 ──
+                if (gs.isHumanTurn) {
+                    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                        handle_local_player_click(GetMousePosition());
+                    }
+                } else {
+                    // 電腦 AI（加計時器增加真實感）
+                    gs.aiTimer++;
+                    if (gs.aiTimer > 40) {
+                        local_ai_move(&gs);
+                        if (gs.humanColor != -1) gs.currentTurn = 1 - gs.currentTurn;
+                        gs.isHumanTurn = true;
+                        gs.aiTimer = 0;
+                        board_check_win(&gs);
                     }
                 }
-            }
-            // 電腦回合邏輯 (加入計時器讓電腦有一點思考時間)
-            else {
-                aiTimer++;
-                if (aiTimer > 40) { // 等待約 40 幀 (約 0.6 秒) 後執行移動
-                    DoComputerMove();
-                    if (humanColor != -1) currentTurn = 1 - currentTurn; // 切換畫面文字
-                    isHumanTurn = true; // 換回玩家
-                    aiTimer = 0;
-                    CheckWinCondition();
-                }
-            }
-        }
-        else if (IsKeyPressed(KEY_R)) InitAndShuffleBoard();
 
-        // --- 繪圖部分 ---
+            } else {
+                // ── 線上模式 ──
+                // 1. 輪詢背景執行緒有無新訊息
+                char update_buf[8192];
+                if (network_poll(update_buf, sizeof(update_buf))) {
+                    process_server_update(update_buf);
+                }
+
+                // 2. 玩家手動操作（如果這個 client 想讓玩家而非 AI 操作）
+                //    目前設計：線上模式全交給 AI（process_server_update 內部呼叫）
+                //    若要改成玩家手動操作線上模式，解除下面的注釋並移除 AI 呼叫
+                /*
+                if (gs.isMyTurn && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                    handle_online_player_click(GetMousePosition(), last_json);
+                }
+                */
+            }
+            break;
+
+        // ── 勝負畫面 ──
+        case STATE_RED_WIN:
+        case STATE_BLACK_WIN:
+            if (IsKeyPressed(KEY_R)) {
+                reset_game();
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        // ========================================================
+        //  DRAW
+        // ========================================================
         BeginDrawing();
         ClearBackground(RAYWHITE);
 
-        if (gameState == STATE_MENU) {
-            DrawRectangle(0, 0, screenWidth, screenHeight, Fade(DARKGRAY, 0.9f));
-            DrawTextEx(font, "請選擇先後手：", (Vector2) { 270, 150 }, 40, 1, WHITE);
-            DrawTextEx(font, "1. 玩家先手", (Vector2) { 300, 230 }, 30, 1, LIGHTGRAY);
-            DrawTextEx(font, "2. 電腦先手", (Vector2) { 300, 280 }, 30, 1, LIGHTGRAY);
+        switch (gs.state) {
+        case STATE_MAIN_MENU:
+            renderer_draw_main_menu(&renderer, SCREEN_W, SCREEN_H);
+            break;
+        case STATE_HAND_MENU:
+            renderer_draw_hand_menu(&renderer, SCREEN_W, SCREEN_H);
+            break;
+        case STATE_CONNECTING:
+            renderer_draw_connecting(&renderer, SCREEN_W, SCREEN_H, _pending_room_id);
+            break;
+        case STATE_WAITING:
+            renderer_draw_waiting(&renderer, SCREEN_W, SCREEN_H);
+            break;
+        case STATE_PLAYING:
+            renderer_draw_playing(&renderer, &gs, SCREEN_W, SCREEN_H);
+            break;
+        case STATE_RED_WIN:
+        case STATE_BLACK_WIN:
+            renderer_draw_playing(&renderer, &gs, SCREEN_W, SCREEN_H);
+            renderer_draw_result(&renderer, &gs, SCREEN_W, SCREEN_H);
+            break;
+        default:
+            break;
         }
-        else {
-            DrawTexture(boardTex, bx, by, WHITE);
 
-            for (int r = 0; r < 4; r++) {
-                for (int c = 0; c < 8; c++) {
-                    Piece p = boardGrid[r][c];
-                    if (p.isEmpty) continue;
-                    float px = bx + sx + (c * cw) + (cw / 2.0f) - (pieceBack.width / 2.0f);
-                    float py = by + sy + (r * ch) + (ch / 2.0f) - (pieceBack.height / 2.0f);
-                    if (!p.isFlipped) DrawTexture(pieceBack, px, py, WHITE);
-                    else {
-                        DrawTexture((p.color == PIECE_RED) ? pieceRed : pieceBlack, px, py, WHITE);
-                        const char* n = (p.color == PIECE_RED) ? RED_NAMES[p.role] : BLACK_NAMES[p.role];
-                        Vector2 v = MeasureTextEx(font, n, 50, 1);
-                        DrawTextEx(font, n, (Vector2) { px + pieceRed.width / 2 - v.x / 2, py + pieceRed.height / 2 - v.y / 2 }, 50, 1, (p.color == PIECE_RED) ? MAROON : BLACK);
-                    }
-                }
-            }
-
-            if (selectedRow != -1) DrawRectangleLinesEx((Rectangle) { bx + sx + selectedCol * cw, by + sy + selectedRow * ch, cw, ch }, 4, GOLD);
-
-            // UI 狀態顯示
-            DrawRectangle(10, 10, 250, 80, Fade(LIGHTGRAY, 0.8f));
-
-            const char* turnText = (humanColor == -1) ? "請翻第一張牌" : (isHumanTurn ? "輪到你了" : "電腦思考中...");
-            DrawTextEx(font, turnText, (Vector2) { 20, 15 }, 24, 1, isHumanTurn ? BLUE : DARKGRAY);
-
-            const char* colorText = (humanColor == -1) ? "你的陣營：未定" : (humanColor == PIECE_RED ? "你的陣營：紅方" : "你的陣營：黑方");
-            Color cColor = (humanColor == -1) ? BLACK : (humanColor == PIECE_RED ? RED : BLACK);
-            DrawTextEx(font, colorText, (Vector2) { 20, 50 }, 20, 1, cColor);
-
-            if (gameState == STATE_RED_WIN || gameState == STATE_BLACK_WIN) {
-                DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.6f));
-                const char* w = (gameState == STATE_RED_WIN) ? "紅方獲勝！" : "黑方獲勝！";
-                Vector2 ws = MeasureTextEx(font, w, 40, 1);
-                DrawTextEx(font, w, (Vector2) { screenWidth / 2 - ws.x / 2, screenHeight / 2 - 20 }, 40, 1, YELLOW);
-
-                const char* restartMsg = "按下 R 鍵重新開始";
-                Vector2 textSize = MeasureTextEx(font, restartMsg, 20, 1);
-                DrawTextEx(font, restartMsg, (Vector2) { screenWidth / 2 - textSize.x / 2, screenHeight / 2 + 40 }, 20, 1, RAYWHITE);
-            }
-        }
         EndDrawing();
     }
 
-    UnloadTexture(boardTex); UnloadTexture(pieceBack); UnloadTexture(pieceRed); UnloadTexture(pieceBlack); UnloadFont(font);
+    // ── 清理 ──
+    renderer_unload(&renderer);
+    if (gs.mode == MODE_ONLINE) {
+        network_close();
+    }
     CloseWindow();
     return 0;
 }
