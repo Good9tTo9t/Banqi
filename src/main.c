@@ -50,8 +50,8 @@
 #define SCREEN_H 450
 
 // ── 全域共享狀態 ──────────────────────────────────────────────
-static SharedState gs;
-static Renderer    renderer;
+static SharedState  gs;
+static Renderer     renderer;
 
 // ── 線上模式輔助：console 輸入房間號碼 ───────────────────────
 // 因為 Raylib 視窗無法方便地輸入文字，
