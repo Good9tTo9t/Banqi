@@ -1,442 +1,165 @@
-// ── 包含 raylib 與 Windows API 時的衝突處理 ──
-// raylib 和 windows.h 都有定義 Rectangle、CloseWindow、ShowCursor 等符號。
-// 我們透過定義 NOGDI 和 NOUSER 來避免 windows.h 引入不必要的圖形與視窗定義。
-// WIN32_LEAN_AND_MEAN 可避免引入 OLE 等需要 USER 定義的模組。
-#define WIN32_LEAN_AND_MEAN
-#define NOGDI
-#define NOUSER
-
-#include "raylib.h"
-#include "game_state.h"
-#include "board.h"
-#include "renderer.h"
-#include "ai.h"
-#include "network.h"
-
+#include <winsock2.h>
+#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <windows.h>  // Sleep(), CreateThread()
+#include "make_move.h"
+#pragma comment(lib, "ws2_32.lib")
+#define SERVER_IP "140.124.184.220"
+#define PORT 8888
 
+static SOCKET _global_socket = INVALID_SOCKET;
+static char _assigned_role[10] = ""; // "first" or "second"
 
+// 1. 初始化連線
+int init_connection() {
+    WSADATA wsa;
+    struct sockaddr_in server;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
+    if ((_global_socket = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) return -1;
 
-// ============================================================
-//  main.c — 主程式入口
-//
-//  遊戲狀態機：
-//
-//   STATE_MAIN_MENU
-//       │ KEY_1 → 本地模式
-//       │ KEY_2 → 線上模式
-//       ▼
-//   STATE_HAND_MENU (本地)    STATE_CONNECTING (線上)
-//       │ KEY_1/2                   │ console 輸入 JOIN
-//       ▼                           ▼
-//   STATE_PLAYING ──────────────────┘
-//       │ 帥/將被吃
-//       ▼
-//   STATE_RED_WIN / STATE_BLACK_WIN
-//       │ KEY_R
-//       ▼
-//   STATE_MAIN_MENU
-//
-//  執行緒：
-//    主執行緒 — Raylib 遊戲迴圈（繪圖 + 輸入 + 本地 AI）
-//    背景執行緒（線上模式）— network.c 的 recv_thread_func
-// ============================================================
+    server.sin_addr.s_addr = inet_addr(SERVER_IP);
+    server.sin_family = AF_INET;
+    server.sin_port = htons(PORT);
 
-#define SCREEN_W 800
-#define SCREEN_H 450
-
-// ── 全域共享狀態 ──────────────────────────────────────────────
-static SharedState gs;
-static Renderer    renderer;
-
-// ── 線上模式輔助：console 輸入房間號碼 ───────────────────────
-// 因為 Raylib 視窗無法方便地輸入文字，
-// 線上模式的「輸入房號」改在 console 完成（另開執行緒讓 Raylib 不卡住）
-
-static char   _pending_room_id[32] = "";
-static volatile bool _room_input_done = false;
-
-static DWORD WINAPI room_input_thread(LPVOID param) {
-    (void)param;
-    char buf[64];
-    printf("\n====================================\n");
-    printf("[線上模式] 請輸入要加入的房間號碼：");
-    fflush(stdout);
-    if (fgets(buf, sizeof(buf), stdin)) {
-        buf[strcspn(buf, "\r\n")] = '\0';
-        strncpy(_pending_room_id, buf, sizeof(_pending_room_id) - 1);
+    if (connect(_global_socket, (struct sockaddr *)&server, sizeof(server)) < 0) {
+        return -1;
     }
-    _room_input_done = true;
+    printf("Connected to Dark Chess Server!\n");
     return 0;
 }
 
-// ── 線上模式加入房間（在 console 執行緒完成後觸發）────────────
-static void do_join_room(void) {
-    char role[16] = "";
-    printf("[Main] Joining room: %s\n", _pending_room_id);
+// 2. 加入房間並取得角色
+void auto_join_room() {
+    char user_input[100];
+    char response[2000];
+    while (1) {
+        printf("\nPlease enter JOIN <room_id> to start: ");
+        if (fgets(user_input, sizeof(user_input), stdin) == NULL) break;
+        
+        send(_global_socket, user_input, strlen(user_input), 0);
 
-    if (network_join_room(_pending_room_id, role, sizeof(role)) != 0) {
-        printf("[Main] Failed to join room. Returning to main menu.\n");
-        gs.state = STATE_MAIN_MENU;
+        int size = recv(_global_socket, response, 1999, 0);
+        if (size > 0) {
+            response[size] = '\0';
+            printf("[Server]: %s", response);
+            if (strstr(response, "SUCCESS")) {
+                // 提取 ROLE
+                char* role_ptr = strstr(response, "ROLE ");
+                if (role_ptr) {
+                    sscanf(role_ptr + 5, "%s", _assigned_role);
+                    printf("Assigned Role: %s\n", _assigned_role);
+                }
+                printf("Successfully entered the game loop.\n");
+                break; 
+            }
+        }
+        printf("Join failed, please try again.\n");
+    }
+}
+
+// 傳送指令
+void send_action(const char* action) {
+    send(_global_socket, action, strlen(action), 0);
+}
+
+// 接收更新
+void receive_update(char* buffer, int len) {
+    memset(buffer, 0, len);
+    int size = recv(_global_socket, buffer, len - 1, 0);
+    if (size > 0) buffer[size] = '\0';
+}
+
+void close_connection() {
+    closesocket(_global_socket);
+    WSACleanup();
+}
+
+// 輔助函式：從 JSON 中提取 board 陣列中的第 index 個棋子
+void get_piece_at(const char* json, int index, char* out_piece) {
+    const char* board_start = strstr(json, "\"board\": [[");
+    if (!board_start) {
+        strcpy(out_piece, "Unknown");
         return;
     }
-
-    // 設定角色
-    strncpy(gs.roomId, _pending_room_id, sizeof(gs.roomId) - 1);
-    if (strcmp(role, "first") == 0) {
-        gs.serverRole = ROLE_FIRST;
-        strcpy(gs.myRoleAB, "A");
-    } else {
-        gs.serverRole = ROLE_SECOND;
-        strcpy(gs.myRoleAB, "B");
+    
+    const char* p = board_start + 11;
+    for (int i = 0; i <= index; i++) {
+        p = strchr(p, '\"');
+        if (!p) break;
+        p++;
+        const char* end = strchr(p, '\"');
+        if (!end) break;
+        
+        if (i == index) {
+            int len = end - p;
+            if (len > 31) len = 31;
+            strncpy(out_piece, p, len);
+            out_piece[len] = '\0';
+            return;
+        }
+        p = end + 1;
     }
-    gs.myColor[0]  = '\0';   // 等翻牌後才知道顏色
-    gs.oppColor[0] = '\0';
-    gs.lastTotalMoves = -1;
-    gs.isMyTurn = false;
-
-    network_start_recv_thread();
-    gs.state = STATE_WAITING;
-    printf("[Main] Waiting for game to start...\n");
+    strcpy(out_piece, "Unknown");
 }
 
-// ── 線上模式：處理一條伺服器 UPDATE ────────────────────────────
-static void process_server_update(const char* json) {
-    // 解析 state
-    char state_str[20];
-    board_get_game_state_str(json, state_str);
-    printf("[Update] state=%s, myRole=%s\n", state_str, gs.myRoleAB);
-
-    if (strcmp(state_str, "waiting") == 0) {
-        gs.state = STATE_WAITING;
-        printf("[Update] Still waiting...\n");
-        return;
+// 輔助函式：獲取指定角色 (A 或 B) 的顏色 (Red 或 Black)
+void get_role_color(const char* json, const char* role, char* out_color) {
+    char search_key[20];
+    sprintf(search_key, "\"%s\": \"", role);
+    const char* p = strstr(json, search_key);
+    if (p) {
+        p += strlen(search_key);
+        const char* end = strchr(p, '\"');
+        if (end) {
+            int len = end - p;
+            strncpy(out_color, p, len);
+            out_color[len] = '\0';
+            return;
+        }
     }
-
-    if (strcmp(state_str, "playing") == 0 || strcmp(state_str, "finished") == 0) {
-        // 更新棋盤
-        board_parse_json(&gs, json);
-
-        // 更新我的顏色（第一手翻牌後才有）
-        if (gs.myColor[0] == '\0') {
-            char color[10];
-            board_get_role_color(json, gs.myRoleAB, color);
-            if (strcmp(color, "None") != 0) {
-                strncpy(gs.myColor, color, sizeof(gs.myColor) - 1);
-                strcpy(gs.oppColor, strcmp(color, "Red") == 0 ? "Black" : "Red");
-                printf("[Main] My color: %s\n", gs.myColor);
-            }
-        }
-
-        // 判斷是否輪到自己
-        int total_moves = board_get_total_moves(json);
-        char turn_role  = board_get_current_turn_role(json);
-        bool my_turn    = (turn_role == gs.myRoleAB[0]);
-
-        printf("[Update] turn_role='%c', myRoleAB='%s', my_turn=%d, total_moves=%d, lastMoves=%d\n",
-               turn_role ? turn_role : '?', gs.myRoleAB, my_turn, total_moves, gs.lastTotalMoves);
-
-        gs.isMyTurn = my_turn;
-
-        if (strcmp(state_str, "playing") == 0) {
-            gs.state = STATE_PLAYING;
-        }
-
-        // 如果是我的回合且 total_moves 變化了，執行 AI 動作
-        if (my_turn && total_moves != gs.lastTotalMoves) {
-            printf("\n--- My Turn! (Move %d) ---\n", total_moves);
-            gs.lastTotalMoves = total_moves;
-
-            // 如果顏色未定（第一手），先翻牌
-            if (gs.myColor[0] == '\0') {
-                // 找任意一個 Covered 格子翻
-                char piece_name[32];
-                for (int i = 0; i < 32; i++) {
-                    board_get_piece_at(json, i, piece_name);
-                    if (strcmp(piece_name, "Covered") == 0) {
-                        char action[32];
-                        snprintf(action, sizeof(action), "%d %d\n", i / 8, i % 8);
-                        printf("[Main] First flip at index %d\n", i);
-                        Sleep(1500);
-                        network_send_action(action);
-                        return;
-                    }
-                }
-            }
-
-            // 呼叫 AI 決定動作
-            if (gs.myColor[0] != '\0') {
-                char action[64] = "";
-                if (server_ai_decide(json, gs.myColor, action, sizeof(action))) {
-                    Sleep(1500);  // 模擬思考時間
-                    network_send_action(action);
-                } else {
-                    printf("[Main] AI failed to decide a move!\n");
-                }
-            }
-        }
-
-        // 勝負判定（本地檢查一次）
-        board_check_win(&gs);
-    }
+    strcpy(out_color, "None");
 }
 
-// ── 本地模式：玩家滑鼠操作 ────────────────────────────────────
-static void handle_local_player_click(Vector2 mouse) {
-    int row, col;
-    if (!renderer_screen_to_grid(&renderer, mouse, &row, &col)) return;
 
-    Piece* target = &gs.board[row][col];
 
-    if (gs.selectedRow == -1) {
-        // 未選中狀態
-        if (!target->isEmpty && !target->isFlipped) {
-            // 翻牌
-            target->isFlipped = true;
-            if (gs.humanColor == -1) {
-                gs.humanColor    = (int)target->color;
-                gs.computerColor = 1 - gs.humanColor;
-                gs.currentTurn   = gs.computerColor;
-            } else {
-                gs.currentTurn = 1 - gs.currentTurn;
+int main() {
+    char board_data[4000];
+    int last_total_moves = -1;
+
+    if (init_connection() != 0) return 1;
+    auto_join_room();
+
+    char my_role_ab[2] = "";
+    if (strcmp(_assigned_role, "first") == 0) strcpy(my_role_ab, "A");
+    else if (strcmp(_assigned_role, "second") == 0) strcpy(my_role_ab, "B");
+
+    while (1) {
+        receive_update(board_data, 4000);
+        printf("%s", board_data);
+        if (strlen(board_data) == 0) break;
+        if (strstr(board_data, "UPDATE")) {
+            // 解析總步數，避免重複處理相同的狀態
+            int current_total_moves = -1;
+            char* moves_p = strstr(board_data, "\"total_moves\": ");
+            if (moves_p) {
+                sscanf(moves_p + 15, "%d", &current_total_moves);
             }
-            gs.isHumanTurn = false;
-        } else if (!target->isEmpty && target->isFlipped &&
-                   (int)target->color == gs.humanColor) {
-            // 選中己方棋子
-            gs.selectedRow = row;
-            gs.selectedCol = col;
-        }
-    } else {
-        // 已選中狀態
-        if (row == gs.selectedRow && col == gs.selectedCol) {
-            // 取消選取
-            gs.selectedRow = -1;
-            gs.selectedCol = -1;
-        } else if (!target->isEmpty && target->isFlipped &&
-                   (int)target->color == gs.humanColor) {
-            // 換選另一個己方棋子
-            gs.selectedRow = row;
-            gs.selectedCol = col;
-        } else if (board_is_valid_move(&gs, gs.selectedRow, gs.selectedCol, row, col)) {
-            // 執行移動/吃子
-            gs.board[row][col] = gs.board[gs.selectedRow][gs.selectedCol];
-            gs.board[gs.selectedRow][gs.selectedCol].isEmpty = true;
-            gs.selectedRow = -1;
-            gs.selectedCol = -1;
-            gs.currentTurn = 1 - gs.currentTurn;
-            gs.isHumanTurn = false;
-        }
-    }
-    board_check_win(&gs);
-}
 
-// ── 重置為初始狀態 ─────────────────────────────────────────────
-static void reset_game(void) {
-    // 線上模式的連線不在這裡重置（只重置本地遊戲狀態）
-    if (gs.mode == MODE_ONLINE) {
-        network_close();
-    }
-    memset(&gs, 0, sizeof(gs));
-    gs.state       = STATE_MAIN_MENU;
-    gs.selectedRow = -1;
-    gs.selectedCol = -1;
-    gs.humanColor  = -1;
-    gs.computerColor = -1;
-    gs.currentTurn = -1;
-    gs.isHumanTurn = true;
-    gs.lastTotalMoves = -1;
-    _pending_room_id[0] = '\0';
-    _room_input_done    = false;
-}
-
-// ── main ──────────────────────────────────────────────────────
-int main(void) {
-    setvbuf(stdout, NULL, _IONBF, 0);  // 關閉 stdout 緩衝，printf 立即顯示
-    SetConsoleOutputCP(65001);          // 設定 console 為 UTF-8 編碼
-    SetConsoleCP(65001);                // 輸入也用 UTF-8
-    srand((unsigned int)time(NULL));
-    printf("The program has started\n");
-    // 初始化 SharedState
-    memset(&gs, 0, sizeof(gs));
-    gs.state          = STATE_MAIN_MENU;
-    gs.selectedRow    = -1;
-    gs.selectedCol    = -1;
-    gs.humanColor     = -1;
-    gs.computerColor  = -1;
-    gs.currentTurn    = -1;
-    gs.isHumanTurn    = true;
-    gs.lastTotalMoves = -1;
-
-    // 初始化 Raylib
-    InitWindow(SCREEN_W, SCREEN_H, "暗棋 Dark Chess");
-    SetTargetFPS(60);
-
-    if (renderer_init(&renderer, SCREEN_W, SCREEN_H) != 0) {
-        CloseWindow();
-        return 1;
-    }
-
-    // ── 主遊戲迴圈 ───────────────────────────────────────────
-    while (!WindowShouldClose()) {
-
-        // ========================================================
-        //  UPDATE
-        // ========================================================
-
-        switch (gs.state) {
-
-        // ── 主選單 ──
-        case STATE_MAIN_MENU:
-            if (IsKeyPressed(KEY_ONE)) {
-                printf("[Main] KEY_ONE pressed -> Local mode\n");
-                gs.mode  = MODE_LOCAL;
-                gs.state = STATE_HAND_MENU;
-            } else if (IsKeyPressed(KEY_TWO)) {
-                printf("[Main] KEY_TWO pressed -> Online mode\n");
-                gs.mode  = MODE_ONLINE;
-                gs.state = STATE_CONNECTING;
-                // 初始化網路（非阻塞，畫面會繼續跑）
-                printf("[Main] Connecting to server...\n");
-                if (network_init() != 0) {
-                    printf("[Main] Server connection failed. Back to menu.\n");
-                    gs.state = STATE_MAIN_MENU;
-                } else {
-                    // 開 console 執行緒讓使用者輸入房號
-                    _room_input_done = false;
-                    HANDLE t = CreateThread(NULL, 0, room_input_thread, NULL, 0, NULL);
-                    CloseHandle(t);
+            const char* turn_role_p = strstr(board_data, "\"current_turn_role\": \"");
+            if (turn_role_p) {
+                turn_role_p += 22;
+                char current_turn_role[2] = { turn_role_p[0], '\0' };
+                
+                // 只有在回合匹配且狀態是新的時候才動作
+                if (strcmp(current_turn_role, my_role_ab) == 0 && current_total_moves != last_total_moves) {
+                    printf("It's my turn (Role %s, Move %d). Thinking...\n", my_role_ab, current_total_moves);
+                    make_move(board_data, my_role_ab);
+                    last_total_moves = current_total_moves;
                 }
             }
-            break;
-
-        // ── 先後手選單（本地模式）──
-        case STATE_HAND_MENU:
-            if (IsKeyPressed(KEY_ONE)) {
-                // 玩家先手：人先翻牌
-                board_init_and_shuffle(&gs);
-                gs.isHumanTurn = true;
-                gs.state       = STATE_PLAYING;
-            } else if (IsKeyPressed(KEY_TWO)) {
-                // 電腦先手：AI 先翻牌
-                board_init_and_shuffle(&gs);
-                gs.isHumanTurn = false;
-                gs.state       = STATE_PLAYING;
-            }
-            break;
-
-        // ── 連線中（等待 console 輸入完成）──
-        case STATE_CONNECTING:
-            if (_room_input_done) {
-                _room_input_done = false;
-                do_join_room();
-            }
-            break;
-
-        // ── 等待對手 ──
-        case STATE_WAITING: {
-            char update_buf[8192];
-            if (network_poll(update_buf, sizeof(update_buf))) {
-                process_server_update(update_buf);
-            }
-            break;
         }
-
-        // ── 遊玩中 ──
-        case STATE_PLAYING:
-
-            if (gs.mode == MODE_LOCAL) {
-                // ── 本地模式 ──
-                if (gs.isHumanTurn) {
-                    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                        handle_local_player_click(GetMousePosition());
-                    }
-                } else {
-                    // 電腦 AI（加計時器增加真實感）
-                    gs.aiTimer++;
-                    if (gs.aiTimer > 40) {
-                        local_ai_move(&gs);
-                        if (gs.humanColor != -1) gs.currentTurn = 1 - gs.currentTurn;
-                        gs.isHumanTurn = true;
-                        gs.aiTimer = 0;
-                        board_check_win(&gs);
-                    }
-                }
-
-            } else {
-                // ── 線上模式 ──
-                // 1. 輪詢背景執行緒有無新訊息
-                char update_buf[8192];
-                if (network_poll(update_buf, sizeof(update_buf))) {
-                    process_server_update(update_buf);
-                }
-
-                // 2. 玩家手動操作（如果這個 client 想讓玩家而非 AI 操作）
-                //    目前設計：線上模式全交給 AI（process_server_update 內部呼叫）
-                //    若要改成玩家手動操作線上模式，解除下面的注釋並移除 AI 呼叫
-                /*
-                if (gs.isMyTurn && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                    handle_online_player_click(GetMousePosition(), last_json);
-                }
-                */
-            }
-            break;
-
-        // ── 勝負畫面 ──
-        case STATE_RED_WIN:
-        case STATE_BLACK_WIN:
-            if (IsKeyPressed(KEY_R)) {
-                reset_game();
-            }
-            break;
-
-        default:
-            break;
-        }
-
-        // ========================================================
-        //  DRAW
-        // ========================================================
-        BeginDrawing();
-        ClearBackground(RAYWHITE);
-
-        switch (gs.state) {
-        case STATE_MAIN_MENU:
-            renderer_draw_main_menu(&renderer, SCREEN_W, SCREEN_H);
-            break;
-        case STATE_HAND_MENU:
-            renderer_draw_hand_menu(&renderer, SCREEN_W, SCREEN_H);
-            break;
-        case STATE_CONNECTING:
-            renderer_draw_connecting(&renderer, SCREEN_W, SCREEN_H, _pending_room_id);
-            break;
-        case STATE_WAITING:
-            renderer_draw_waiting(&renderer, SCREEN_W, SCREEN_H);
-            break;
-        case STATE_PLAYING:
-            renderer_draw_playing(&renderer, &gs, SCREEN_W, SCREEN_H);
-            break;
-        case STATE_RED_WIN:
-        case STATE_BLACK_WIN:
-            renderer_draw_playing(&renderer, &gs, SCREEN_W, SCREEN_H);
-            renderer_draw_result(&renderer, &gs, SCREEN_W, SCREEN_H);
-            break;
-        default:
-            break;
-        }
-
-        EndDrawing();
     }
-
-    // ── 清理 ──
-    renderer_unload(&renderer);
-    if (gs.mode == MODE_ONLINE) {
-        network_close();
-    }
-    CloseWindow();
+    close_connection();
     return 0;
 }
